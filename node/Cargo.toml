@@ -18,7 +18,7 @@ ipfs-api = { git = "https://github.com/ferristseng/rust-ipfs-api", branch = "mas
 itertools = "0.7"
 lazy_static = "1.2.0"
 sentry = "0.15.5"
-url = "1.7.1"
+url = "2.1.0"
 crossbeam-channel = "0.3.8"
 graph = { path = "../graph" }
 graph-core = { path = "../core" }
