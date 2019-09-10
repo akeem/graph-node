@@ -123,6 +123,9 @@ pub struct Layout {
     /// database tables that contain entities implementing
     /// that interface
     pub interfaces: HashMap<String, Vec<Rc<Table>>>,
+    /// Enums defined in the schema and their possible values. The names
+    /// are the original GraphQL names
+    pub enums: HashMap<String, Vec<String>>,
     /// The query to count all entities
     pub count_query: String,
 }
@@ -148,33 +151,36 @@ impl Layout {
         let schema = schema.into();
         SqlName::check_valid_identifier(&schema, "database schema")?;
 
-        // Check that we can handle all the definitions
-        for defn in &document.definitions {
-            match defn {
-                TypeDefinition(Object(_)) | TypeDefinition(Interface(_)) => (),
-                other => {
-                    return Err(StoreError::Unknown(format_err!(
-                        "can not handle {:?}",
-                        other
-                    )))
-                }
-            }
-        }
-
         // Extract interfaces and tables
         let mut interfaces: HashMap<String, Vec<SqlName>> = HashMap::new();
         let mut tables = Vec::new();
+        let mut enums = HashMap::new();
 
         for defn in &document.definitions {
             match defn {
                 TypeDefinition(Object(obj_type)) => {
-                    let table =
-                        Table::new(obj_type, &mut interfaces, id_type, tables.len() as u32)?;
+                    let table = Table::new(
+                        obj_type,
+                        &schema,
+                        &mut interfaces,
+                        &enums,
+                        id_type,
+                        tables.len() as u32,
+                    )?;
                     tables.push(table);
                 }
                 TypeDefinition(Interface(interface_type)) => {
                     SqlName::check_valid_identifier(&interface_type.name, "interface")?;
                     interfaces.insert(interface_type.name.clone(), vec![]);
+                }
+                TypeDefinition(Enum(enum_type)) => {
+                    SqlName::check_valid_identifier(&enum_type.name, "enum")?;
+                    let values: Vec<_> = enum_type
+                        .values
+                        .iter()
+                        .map(|value| value.name.to_owned())
+                        .collect();
+                    enums.insert(enum_type.name.clone(), values);
                 }
                 other => {
                     return Err(StoreError::Unknown(format_err!(
@@ -230,6 +236,7 @@ impl Layout {
             schema,
             tables,
             interfaces,
+            enums,
             count_query,
         })
     }
@@ -257,6 +264,17 @@ impl Layout {
     pub fn as_ddl(&self) -> Result<String, fmt::Error> {
         let mut out = String::new();
 
+        // Output enums first
+        for (name, values) in &self.enums {
+            let mut sep = "";
+            let name = SqlName::from(name.as_str());
+            write!(out, "create type {}.{}\n    as enum (", self.schema, name)?;
+            for value in values {
+                write!(out, "{}'{}'", sep, value)?;
+                sep = ", "
+            }
+            write!(out, ");\n")?;
+        }
         // We sort tables here solely because the unit tests rely on
         // 'create table' statements appearing in a fixed order
         let mut tables = self.tables.values().collect::<Vec<_>>();
@@ -499,18 +517,41 @@ pub struct Column {
     pub field: String,
     pub field_type: q::Type,
     pub column_type: ColumnType,
+    /// If this is a user-defined enum, store the name of the corresponding
+    /// Postgres enum type here. We store the name qualified with the schema
+    /// name, i.e. as `schema.enum_type`
+    pub enum_type: Option<SqlName>,
 }
 
 impl Column {
-    fn new(field: &s::Field, id_type: IdType) -> Result<Column, StoreError> {
+    fn new(
+        field: &s::Field,
+        schema: &str,
+        enums: &HashMap<String, Vec<String>>,
+        id_type: IdType,
+    ) -> Result<Column, StoreError> {
         SqlName::check_valid_identifier(&*field.name, "attribute")?;
 
         let sql_name = SqlName::from(&*field.name);
+        let field_type = named_type(&field.field_type);
+        let enum_type = if enums.contains_key(field_type) {
+            // We do things this convoluted way to make sure field_type gets
+            // snakecased, but the `.` must stay a `.`
+            Some(SqlName(format!(
+                "\"{}\".\"{}\"",
+                schema,
+                SqlName::from(field_type)
+            )))
+        } else {
+            None
+        };
+
         Ok(Column {
             name: sql_name,
             field: field.name.clone(),
             column_type: ColumnType::from_value_type(base_type(&field.field_type), id_type)?,
             field_type: field.field_type.clone(),
+            enum_type,
         })
     }
 
@@ -541,6 +582,10 @@ impl Column {
         is_list(&self.field_type)
     }
 
+    pub fn is_enum(&self) -> bool {
+        self.enum_type.is_some()
+    }
+
     /// Generate the DDL for one column, i.e. the part of a `create table`
     /// statement for this column.
     ///
@@ -548,7 +593,11 @@ impl Column {
     /// gets generated
     fn as_ddl(&self, out: &mut String) -> fmt::Result {
         write!(out, "    ")?;
-        write!(out, "{:20} {}", self.name, self.sql_type())?;
+        let type_name = match &self.enum_type {
+            Some(ref type_name) => type_name.as_str(),
+            None => self.sql_type(),
+        };
+        write!(out, "{:20} {}", self.name, type_name)?;
         if self.is_list() {
             write!(out, "[]")?;
         }
@@ -582,7 +631,9 @@ pub struct Table {
 impl Table {
     fn new(
         defn: &s::ObjectType,
+        schema: &str,
         interfaces: &mut HashMap<String, Vec<SqlName>>,
+        enums: &HashMap<String, Vec<String>>,
         id_type: IdType,
         position: u32,
     ) -> Result<Table, StoreError> {
@@ -593,7 +644,7 @@ impl Table {
             .fields
             .iter()
             .filter(|field| !derived_column(field))
-            .map(|field| Column::new(field, id_type))
+            .map(|field| Column::new(field, schema, enums, id_type))
             .collect::<Result<Vec<_>, _>>()?;
         let table = Table {
             object: defn.name.clone(),
@@ -652,7 +703,14 @@ impl Table {
             block_range = BLOCK_RANGE
         )?;
 
-        for (i, column) in self.columns.iter().enumerate() {
+        // Create indexes. Don't bother with enum types, since an index on a
+        // column that can take only a handful of values is pointless
+        for (i, column) in self
+            .columns
+            .iter()
+            .filter(|column| !column.is_enum())
+            .enumerate()
+        {
             // Attributes that are plain strings are indexed with a BTree; but
             // they can be too large for Postgres' limit on values that can go
             // into a BTree. For those attributes, only index the first
@@ -767,6 +825,12 @@ mod tests {
             bigThing: Thing!
         }
 
+        enum Color {
+            yellow,
+            red,
+            BLUE
+        }
+
         type Scalar {
             id: ID,
             bool: Boolean,
@@ -775,9 +839,12 @@ mod tests {
             string: String,
             bytes: Bytes,
             bigInt: BigInt,
+            color: Color,
         }";
 
-    const THING_DDL: &str = "create table rel.thing (
+    const THING_DDL: &str = "create type rel.color
+    as enum ('yellow', 'red', 'BLUE');
+create table rel.thing (
         id                   text not null,
         big_thing            text not null,
 
@@ -797,6 +864,7 @@ create table rel.scalar (
         string               text,
         bytes                bytea,
         big_int              numeric,
+        color                \"rel\".\"color\",
 
         block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
