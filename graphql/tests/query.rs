@@ -85,6 +85,8 @@ fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
                 false,
                 Default::default(),
                 Default::default(),
+                0,
+                0
             )
             .create_operations_replace(&id),
             None,

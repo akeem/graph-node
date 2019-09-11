@@ -33,6 +33,8 @@ fn insert_and_query(
         false,
         Default::default(),
         Default::default(),
+        0,
+        0
     )
     .create_operations_replace(&subgraph_id);
     STORE
