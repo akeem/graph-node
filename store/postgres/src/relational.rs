@@ -11,7 +11,7 @@ use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graphql_parser::query as q;
 use graphql_parser::schema as s;
 use inflector::Inflector;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -109,6 +109,8 @@ pub enum IdType {
     Bytes,
 }
 
+type EnumMap = BTreeMap<String, Vec<String>>;
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     /// The SQL type for columns with GraphQL type `ID`
@@ -125,7 +127,7 @@ pub struct Layout {
     pub interfaces: HashMap<String, Vec<Rc<Table>>>,
     /// Enums defined in the schema and their possible values. The names
     /// are the original GraphQL names
-    pub enums: HashMap<String, Vec<String>>,
+    pub enums: EnumMap,
     /// The query to count all entities
     pub count_query: String,
 }
@@ -154,7 +156,7 @@ impl Layout {
         // Extract interfaces and tables
         let mut interfaces: HashMap<String, Vec<SqlName>> = HashMap::new();
         let mut tables = Vec::new();
-        let mut enums = HashMap::new();
+        let mut enums = EnumMap::new();
 
         for defn in &document.definitions {
             match defn {
@@ -464,7 +466,7 @@ impl Layout {
 /// This is almost the same as graph::data::store::ValueType, but without
 /// ID and List; with this type, we only care about scalar types that directly
 /// correspond to Postgres scalar types
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ColumnType {
     Boolean,
     BigDecimal,
@@ -472,6 +474,9 @@ pub enum ColumnType {
     Bytes,
     Int,
     String,
+    /// A user-defined enum. The string contains the name of the Postgres
+    /// enum we created for it, fully qualified with the schema
+    Enum(SqlName),
 }
 
 impl From<IdType> for ColumnType {
@@ -484,7 +489,30 @@ impl From<IdType> for ColumnType {
 }
 
 impl ColumnType {
-    fn from_value_type(value_type: ValueType, id_type: IdType) -> Result<ColumnType, StoreError> {
+    fn from_field_type(
+        field_type: &q::Type,
+        schema: &str,
+        enums: &EnumMap,
+        id_type: IdType,
+    ) -> Result<ColumnType, StoreError> {
+        let name = named_type(field_type);
+
+        // Check if it's an enum, and if it is, return an appropriate
+        // ColumnType::Enum
+        if enums.contains_key(&*name) {
+            // We do things this convoluted way to make sure field_type gets
+            // snakecased, but the `.` must stay a `.`
+            return Ok(ColumnType::Enum(SqlName(format!(
+                "\"{}\".\"{}\"",
+                schema,
+                SqlName::from(name)
+            ))));
+        }
+
+        // It is not an enum, and therefore one of our builtin primitive types
+        // or a reference to another type. For the latter, we use `ValueType::ID`
+        // as the underlying type
+        let value_type = ValueType::from_str(name).unwrap_or(ValueType::ID);
         match value_type {
             ValueType::Boolean => Ok(ColumnType::Boolean),
             ValueType::BigDecimal => Ok(ColumnType::BigDecimal),
@@ -507,6 +535,7 @@ impl ColumnType {
             ColumnType::Bytes => "bytea",
             ColumnType::Int => "integer",
             ColumnType::String => "text",
+            ColumnType::Enum(name) => name.as_str(),
         }
     }
 }
@@ -517,41 +546,24 @@ pub struct Column {
     pub field: String,
     pub field_type: q::Type,
     pub column_type: ColumnType,
-    /// If this is a user-defined enum, store the name of the corresponding
-    /// Postgres enum type here. We store the name qualified with the schema
-    /// name, i.e. as `schema.enum_type`
-    pub enum_type: Option<SqlName>,
 }
 
 impl Column {
     fn new(
         field: &s::Field,
         schema: &str,
-        enums: &HashMap<String, Vec<String>>,
+        enums: &EnumMap,
         id_type: IdType,
     ) -> Result<Column, StoreError> {
         SqlName::check_valid_identifier(&*field.name, "attribute")?;
 
         let sql_name = SqlName::from(&*field.name);
-        let field_type = named_type(&field.field_type);
-        let enum_type = if enums.contains_key(field_type) {
-            // We do things this convoluted way to make sure field_type gets
-            // snakecased, but the `.` must stay a `.`
-            Some(SqlName(format!(
-                "\"{}\".\"{}\"",
-                schema,
-                SqlName::from(field_type)
-            )))
-        } else {
-            None
-        };
 
         Ok(Column {
             name: sql_name,
             field: field.name.clone(),
-            column_type: ColumnType::from_value_type(base_type(&field.field_type), id_type)?,
+            column_type: ColumnType::from_field_type(&field.field_type, schema, enums, id_type)?,
             field_type: field.field_type.clone(),
-            enum_type,
         })
     }
 
@@ -583,7 +595,18 @@ impl Column {
     }
 
     pub fn is_enum(&self) -> bool {
-        self.enum_type.is_some()
+        if let ColumnType::Enum(_) = self.column_type {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return `true` if this column stores user-supplied text. Such
+    /// columns may contain very large values and need to be handled
+    /// specially for indexing
+    pub fn is_text(&self) -> bool {
+        named_type(&self.field_type) == "String" && !self.is_list()
     }
 
     /// Generate the DDL for one column, i.e. the part of a `create table`
@@ -593,11 +616,7 @@ impl Column {
     /// gets generated
     fn as_ddl(&self, out: &mut String) -> fmt::Result {
         write!(out, "    ")?;
-        let type_name = match &self.enum_type {
-            Some(ref type_name) => type_name.as_str(),
-            None => self.sql_type(),
-        };
-        write!(out, "{:20} {}", self.name, type_name)?;
+        write!(out, "{:20} {}", self.name, self.sql_type())?;
         if self.is_list() {
             write!(out, "[]")?;
         }
@@ -633,7 +652,7 @@ impl Table {
         defn: &s::ObjectType,
         schema: &str,
         interfaces: &mut HashMap<String, Vec<SqlName>>,
-        enums: &HashMap<String, Vec<String>>,
+        enums: &EnumMap,
         id_type: IdType,
         position: u32,
     ) -> Result<Table, StoreError> {
@@ -715,12 +734,11 @@ impl Table {
             // they can be too large for Postgres' limit on values that can go
             // into a BTree. For those attributes, only index the first
             // STRING_PREFIX_SIZE characters
-            let index_expr =
-                if !column.is_list() && base_type(&column.field_type) == ValueType::String {
-                    format!("left({}, {})", column.name, STRING_PREFIX_SIZE)
-                } else {
-                    column.name.to_string()
-                };
+            let index_expr = if column.is_text() {
+                format!("left({}, {})", column.name, STRING_PREFIX_SIZE)
+            } else {
+                column.name.to_string()
+            };
 
             let method = if column.is_list() { "gin" } else { "btree" };
             write!(
@@ -737,15 +755,6 @@ impl Table {
         }
         write!(out, "\n")
     }
-}
-
-/// Return the base type underlying the given field type, i.e., the type
-/// after stripping List and NonNull. For types that are not the builtin
-/// GraphQL scalar types, and therefore references to other GraphQL objects,
-/// use `ValueType::ID`
-fn base_type(field_type: &q::Type) -> ValueType {
-    let name = named_type(field_type);
-    ValueType::from_str(name).unwrap_or(ValueType::ID)
 }
 
 /// Return the enclosed named type for a field type, i.e., the type after
@@ -825,11 +834,9 @@ mod tests {
             bigThing: Thing!
         }
 
-        enum Color {
-            yellow,
-            red,
-            BLUE
-        }
+        enum Color { yellow, red, BLUE }
+
+        enum Size { small, medium, large }
 
         type Scalar {
             id: ID,
@@ -844,6 +851,8 @@ mod tests {
 
     const THING_DDL: &str = "create type rel.color
     as enum ('yellow', 'red', 'BLUE');
+create type rel.size
+    as enum (\'small\', \'medium\', \'large\');
 create table rel.thing (
         id                   text not null,
         big_thing            text not null,
